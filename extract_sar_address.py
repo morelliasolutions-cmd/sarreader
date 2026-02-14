@@ -64,6 +64,7 @@ logger.info(f"   Max upload: {MAX_UPLOAD_SIZE_MB}MB")
 def extract_address_from_sar_pdf(pdf_bytes: bytes, filename: str) -> Dict:
     """
     Extrait l'adresse, le NPA et la commune depuis un fichier SAR PDF
+    Version robuste avec plusieurs stratégies d'extraction
     
     Args:
         pdf_bytes: Contenu du PDF en bytes
@@ -87,60 +88,109 @@ def extract_address_from_sar_pdf(pdf_bytes: bytes, filename: str) -> Dict:
                     logger.warning(f"  ⚠️ Page {page_num} vide ou illisible")
                     continue
                 
-                # Chercher le pattern "Libellé d'adresse :"
-                # Le texte est organisé ligne par ligne
                 lines = text.split('\n')
                 
+                # STRATÉGIE 1 : Chercher "Libellé d'adresse" et analyser les lignes suivantes
                 for i, line in enumerate(lines):
-                    # Recherche du pattern (insensible à la casse et espaces)
-                    if re.search(r"libell[eé]\s+d['']adresse\s*:", line.lower()):
-                        logger.info(f"  ✅ Pattern trouvé à la ligne {i}")
+                    # Chercher le pattern (insensible à la casse, accepte différents apostrophes)
+                    # Unicode \u2019 = ', \u0027 = '
+                    match = re.search(r"libell[eé]\s+d[\'\u2019]adresse\s*:\s*(.+)", line, re.IGNORECASE)
+                    if match:
+                        logger.info(f"  ✅ Pattern 'Libellé d'adresse' trouvé à la ligne {i}")
+                        logger.info(f"  📍 Contenu de la ligne: {line}")
                         
-                        # Extraire les 3 lignes suivantes
-                        # Ligne 1: Adresse (ex: "av. du Simplon 4A")
-                        # Ligne 2: NPA + Commune (ex: "1870 Monthey")
+                        # Extraire l'adresse sur la même ligne (après ":")
+                        address_on_same_line = match.group(1).strip() if match.group(1) else None
                         
-                        if i + 2 < len(lines):
-                            address_line = lines[i + 1].strip()
-                            npa_commune_line = lines[i + 2].strip()
+                        if address_on_same_line:
+                            logger.info(f"  📍 Adresse sur même ligne: {address_on_same_line}")
+                        
+                        # Chercher dans les 5 lignes suivantes
+                        address_line = address_on_same_line
+                        npa = None
+                        commune = None
+                        
+                        for j in range(1, min(6, len(lines) - i)):
+                            candidate = lines[i + j].strip()
                             
-                            logger.info(f"  📍 Adresse brute: {address_line}")
-                            logger.info(f"  📍 NPA/Commune brute: {npa_commune_line}")
+                            # Ignorer les lignes vides ou trop courtes
+                            if not candidate or len(candidate) < 3:
+                                continue
                             
-                            # Parser la ligne NPA + Commune
-                            # Format attendu: "1870 Monthey" ou "187000 Monthey"
-                            npa_commune_match = re.match(r'^(\d{4,6})\s+(.+)$', npa_commune_line)
-                            
-                            if npa_commune_match:
-                                npa = npa_commune_match.group(1).strip()
-                                commune = npa_commune_match.group(2).strip()
-                                
-                                # Nettoyer le NPA (garder seulement 4 chiffres si 6 sont présents)
+                            # Chercher un pattern NPA (4-6 chiffres) + Commune
+                            npa_match = re.match(r'^(\d{4,6})\s+(.+)$', candidate)
+                            if npa_match and not npa:
+                                npa = npa_match.group(1).strip()
+                                commune = npa_match.group(2).strip()
+                                # Nettoyer le NPA (garder 4 chiffres)
                                 if len(npa) > 4:
                                     npa = npa[:4]
-                                
-                                result = {
-                                    'success': True,
-                                    'data': {
-                                        'address': address_line,
-                                        'npa': npa,
-                                        'commune': commune
-                                    },
-                                    'page': page_num
-                                }
-                                
-                                logger.info(f"  ✅ Extraction réussie: {result['data']}")
-                                return result
-                            else:
-                                logger.warning(f"  ⚠️ Format NPA/Commune non reconnu: {npa_commune_line}")
-                        else:
-                            logger.warning(f"  ⚠️ Pas assez de lignes après le pattern")
+                                logger.info(f"  📍 NPA+Commune trouvés: {npa} {commune}")
+                                continue
+                            
+                            # Si pas encore d'adresse et que ce n'est pas un NPA, c'est l'adresse
+                            if not address_line and not re.match(r'^\d{4,6}\s', candidate):
+                                # Ignorer certains patterns communs non-adresses
+                                if not re.match(r'^(données|contact|client|swisscom)', candidate.lower()):
+                                    address_line = candidate
+                                    logger.info(f"  📍 Adresse trouvée: {address_line}")
+                        
+                        # Si on a au moins le NPA/Commune, on retourne
+                        if npa and commune:
+                            result = {
+                                'success': True,
+                                'data': {
+                                    'address': address_line or 'Non spécifiée',
+                                    'npa': npa,
+                                    'commune': commune
+                                },
+                                'page': page_num
+                            }
+                            logger.info(f"  ✅ Extraction réussie: {result['data']}")
+                            return result
+                
+                # STRATÉGIE 2 : Chercher directement des patterns d'adresse suisse dans tout le texte
+                logger.info(f"  🔍 Stratégie 2: recherche globale de NPA+Commune")
+                for i, line in enumerate(lines):
+                    # Chercher format: 1234 Ville ou 123456 Ville
+                    npa_match = re.search(r'(\d{4,6})\s+([A-Z][a-zàâäéèêëïôùûü\-\s]+)', line)
+                    if npa_match:
+                        npa = npa_match.group(1)
+                        commune = npa_match.group(2).strip()
+                        
+                        # Nettoyer le NPA
+                        if len(npa) > 4:
+                            npa = npa[:4]
+                        
+                        # Chercher une adresse dans les lignes précédentes (rue + numéro)
+                        address_line = None
+                        for j in range(max(0, i-3), i):
+                            candidate = lines[j].strip()
+                            # Pattern adresse: commence par mot + possiblement numéro
+                            if re.match(r'^[A-Za-zàâäéèêëïôùûü].+\d+[A-Za-z]?$', candidate):
+                                address_line = candidate
+                                break
+                        
+                        logger.info(f"  📍 Trouvé (stratégie 2): NPA={npa}, Commune={commune}")
+                        if address_line:
+                            logger.info(f"  📍 Adresse associée: {address_line}")
+                        
+                        result = {
+                            'success': True,
+                            'data': {
+                                'address': address_line or 'Non spécifiée',
+                                'npa': npa,
+                                'commune': commune
+                            },
+                            'page': page_num
+                        }
+                        return result
         
-        # Si on arrive ici, le pattern n'a pas été trouvé
-        logger.error(f"  ❌ Pattern 'Libellé d\\'adresse' introuvable dans {filename}")
+        # Si on arrive ici, aucune extraction n'a réussi
+        logger.error(f"  ❌ Impossible d'extraire l'adresse de {filename}")
         return {
             'success': False,
-            'error': 'Pattern "Libellé d\'adresse" introuvable dans le PDF'
+            'error': 'Impossible d\'extraire l\'adresse du PDF. Format non reconnu.'
         }
         
     except Exception as e:
